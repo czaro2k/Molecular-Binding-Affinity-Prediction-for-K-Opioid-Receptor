@@ -1,0 +1,320 @@
+
+!pip install rdkit-pypi
+
+import pandas as pd
+import numpy as np
+import itertools
+import matplotlib.pyplot as plt
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem, MACCSkeys, rdMolDescriptors
+from rdkit.Chem.EState import Fingerprinter as EStateFingerprinter
+from rdkit.Avalon import pyAvalonTools
+from torch import nn, optim
+from torch.utils.data import DataLoader, TensorDataset
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, matthews_corrcoef
+from scipy.stats import pearsonr
+
+def smiles_to_fingerprint(smiles,  fingerprint_types=['Morgan', 'Avalon', 'Estate', 'Topological'] , radius=2, n_bits=2048):
+    try:
+        mol = Chem.MolFromSmiles(smiles)  # Convert SMILES to RDKit mol object
+        if not mol:
+            return np.zeros(n_bits)  # Return zero vector if molecule is invalid
+
+        fingerprint_combination = []
+
+        # Morgan Fingerprinta
+        if "Morgan" in fingerprint_types:
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+            arr = np.zeros((n_bits,), dtype=np.int8)
+            DataStructs.ConvertToNumpyArray(fp, arr)
+            fingerprint_combination.append(arr)
+
+        # MACCS Fingerprint
+        if "MACCS" in fingerprint_types:
+            fp = MACCSkeys.GenMACCSKeys(mol)
+            arr = np.zeros((n_bits,), dtype=np.int8)
+            DataStructs.ConvertToNumpyArray(fp, arr)
+            fingerprint_combination.append(arr)
+
+        # EState Fingerprint
+        if "EState" in fingerprint_types:
+            # Use EStateFingerprinter instead of GetEstateFingerprint
+            fp = EStateFingerprinter.FingerprintMol(mol)[0]  # Returns EState fingerprint as list
+            arr = np.array(fp, dtype=np.float32)
+            fingerprint_combination.append(arr)
+
+        # Topological Fingerprint (RDKit)
+        if "Topological" in fingerprint_types:
+            fp = Chem.RDKFingerprint(mol, fpSize=n_bits)
+            arr = np.zeros((n_bits,), dtype=np.int8)
+            DataStructs.ConvertToNumpyArray(fp, arr)
+            fingerprint_combination.append(arr)
+
+        # Avalon Fingerprint
+        if "Avalon" in fingerprint_types:
+            fp = pyAvalonTools.GetAvalonFP(mol, nBits=n_bits)
+            arr = np.zeros((n_bits,), dtype=np.int8)
+            DataStructs.ConvertToNumpyArray(fp, arr)
+            fingerprint_combination.append(arr)
+
+        # Layered Fingerprint
+        if "Layered" in fingerprint_types:
+            fp = Chem.LayeredFingerprint(mol, fpSize=n_bits)
+            arr = np.zeros((n_bits,), dtype=np.int8)
+            DataStructs.ConvertToNumpyArray(fp, arr)
+            fingerprint_combination.append(arr)
+
+        # Concatenate all selected fingerprint arrays
+        return np.concatenate(fingerprint_combination)
+
+    except Exception as e:
+        print(f"Error processing SMILES {smiles}: {e}")
+        return np.zeros(n_bits)  # Return zero vector if there's an error
+
+# Function to process CSV and convert SMILES column to fingerprint vectors
+def process_smiles_csv(csv_file, smiles_column_name='SMILES', pchemb_column_name='pCHEMBL'):
+    # Read CSV into pandas DataFrame
+    df = pd.read_csv(csv_file)
+
+    # Ensure the SMILES and pCHEMBL columns exist
+    if smiles_column_name not in df.columns:
+        raise ValueError(f"Column '{smiles_column_name}' not found in the CSV file.")
+    if pchemb_column_name not in df.columns:
+        raise ValueError(f"Column '{pchemb_column_name}' not found in the CSV file.")
+
+    # Calculate the length of each SMILES sequence
+    df['smiles_length'] = df[smiles_column_name].apply(len)
+
+    # Filter out records with SMILES longer than 80 characters
+    df_filtered = df[df['smiles_length'] <= 80]
+
+    # Calculate percentiles for top and bottom 5% of pCHEMBL values
+    lower_bound = df_filtered[pchemb_column_name].quantile(0.05)
+    upper_bound = df_filtered[pchemb_column_name].quantile(0.95)
+
+    # Filter the DataFrame to keep only the middle 90%
+    df_filtered = df_filtered[(df_filtered[pchemb_column_name] >= lower_bound) & (df_filtered[pchemb_column_name] <= upper_bound)]
+
+    # Apply smiles_to_fingerprint to each SMILES in the DataFrame
+    df_filtered['fingerprint'] = df_filtered[smiles_column_name].apply(smiles_to_fingerprint)
+
+    # Convert the fingerprint column to a numpy array representation
+    df_filtered['fingerprint'] = df_filtered['fingerprint'].apply(lambda x: x.tolist())
+
+    # Keep only the desired columns
+    result_df = df_filtered[[smiles_column_name, pchemb_column_name, 'fingerprint']]
+
+    return result_df  # Return the combined DataFrame
+
+result_df = process_smiles_csv('../data_clean_kop.csv')
+
+# Function to plot learning curves
+def plot_learning_curves(train_losses, val_losses, filename='learning_curves.png'):
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Learning Curves')
+    plt.savefig(filename)
+    plt.show()
+
+# Function to plot predicted vs actual values
+def plot_predictions(y_true, y_pred, filename='predictions.png'):
+    plt.figure(figsize=(6, 6))
+    plt.scatter(y_pred, y_true, alpha=0.5)
+    plt.xlabel('Predicted Values')
+    plt.ylabel('Actual Values')
+
+    x_diag = np.linspace(min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max()), num=10000)
+    plt.plot(x_diag, x_diag, color='red')
+    plt.title('Predicted vs Actual Values')
+    plt.savefig(filename)
+    plt.show()
+
+# Function to calculate metrics
+def calculate_metrics(y_true, y_pred, filename='metrics.txt'):
+    mse = mean_squared_error(y_true, y_pred)
+    pearson_corr, _ = pearsonr(y_true, y_pred)
+    ccc = 2 * pearson_corr / (np.var(y_true) + np.var(y_pred) + (np.mean(y_true) - np.mean(y_pred))**2)
+    mcc = matthews_corrcoef(np.round(y_true), np.round(y_pred))
+
+    with open(filename, 'w') as f:
+        f.write(f'MSE: {mse:.4f}\n')
+        f.write(f'CCC: {ccc:.4f}\n')
+        f.write(f'MCC: {mcc:.4f}\n')
+
+    print(f'MSE: {mse:.4f}')
+    print(f'CCC: {ccc:.4f}')
+    print(f'MCC: {mcc:.4f}')
+
+def train_model(result_df, model_class, epochs=250, batch_size=32):
+    # Extract features and labels from DataFrame
+    X = np.stack(result_df['fingerprint'].values)
+    y = result_df['pCHEMBL'].values
+
+    # Split the data into training, validation, and test sets
+    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.4, random_state=42)
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+    # Standardize the features
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val = scaler.transform(X_val)
+    X_test = scaler.transform(X_test)
+
+    # Convert to PyTorch tensors
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+    X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+    y_val_tensor = torch.tensor(y_val, dtype=torch.float32).view(-1, 1)
+    X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+    y_test_tensor = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
+
+    # Create DataLoader for training and validation
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # Initialize the model, loss function, and optimizer
+    input_dim = X_train.shape[1]
+    model = model_class(input_dim)
+    criterion = nn.MSELoss()  # Use MSELoss for regression
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    # Training loop with early stopping
+    patience = 20
+    best_val_loss = float('inf')
+    no_improve_epochs = 0
+    train_losses = []
+    val_losses = []
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_train_loss = 0
+        for batch_X, batch_y in train_loader:
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+            epoch_train_loss += loss.item() * batch_X.size(0)  # Accumulate loss
+
+        epoch_train_loss /= len(train_loader.dataset)  # Average loss over all batches
+        train_losses.append(epoch_train_loss)
+
+        # Validate the model
+        model.eval()
+        epoch_val_loss = 0
+        with torch.no_grad():
+            for batch_X, batch_y in val_loader:
+                val_outputs = model(batch_X)
+                val_loss = criterion(val_outputs, batch_y)
+                epoch_val_loss += val_loss.item() * batch_X.size(0)  # Accumulate loss
+
+        epoch_val_loss /= len(val_loader.dataset)  # Average loss over all batches
+        val_losses.append(epoch_val_loss)
+
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            no_improve_epochs = 0
+            torch.save(model.state_dict(), 'best_model.pth')  # Save the model if it's the best
+        else:
+            no_improve_epochs += 1
+
+        if (epoch + 1) % 10 == 0:
+            print(f'Epoch [{epoch + 1}/{epochs}], Training Loss: {epoch_train_loss:.4f}, Validation Loss: {epoch_val_loss:.4f}')
+
+        if no_improve_epochs >= patience:
+            print('Early stopping triggered')
+            break
+
+    # Plot learning curves
+    plot_learning_curves(train_losses, val_losses)
+
+    # Load the best model for evaluation
+    model.load_state_dict(torch.load('best_model.pth'))
+
+    # Evaluate on test set
+    model.eval()
+    with torch.no_grad():
+        test_outputs = model(X_test_tensor)
+        test_loss = criterion(test_outputs, y_test_tensor)
+        print(f'Test Loss: {test_loss.item():.4f}')
+
+        # Plot predictions
+        y_pred = test_outputs.numpy().flatten()
+        y_true = y_test_tensor.numpy().flatten()
+        plot_predictions(y_true, y_pred)
+
+        # Calculate metrics
+        calculate_metrics(y_true, y_pred)
+
+# Define the neural network model
+class SimpleNN(nn.Module):
+    def __init__(self, input_dim):
+        super(SimpleNN, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 1)  # Output layer for regression
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.5)
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.relu(self.fc2(x))
+        x = self.dropout(x)
+        x = self.fc3(x)  # No activation function here
+        return x
+
+class DeepNN(nn.Module):
+    def __init__(self, input_dim):
+        super(DeepNN, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 8192)
+        self.fc2 = nn.Linear(8192, 4096)
+        self.fc3 = nn.Linear(4096, 2048)
+        self.fc4 = nn.Linear(2048, 512)
+        self.fc5 = nn.Linear(512, 1)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.3)  # Adjusted dropout rate
+        self.batchnorm1 = nn.BatchNorm1d(8192)
+        self.batchnorm2 = nn.BatchNorm1d(4096)
+        self.batchnorm3 = nn.BatchNorm1d(2048)
+        self.batchnorm4 = nn.BatchNorm1d(512)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.batchnorm1(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+
+        x = self.fc2(x)
+        x = self.batchnorm2(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+
+        x = self.fc3(x)
+        x = self.batchnorm3(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+
+        x = self.fc4(x)
+        x = self.batchnorm4(x)
+        x = self.relu(x)
+
+        x = self.fc5(x)  # Output layer for regression
+        return x
+
+train_model(result_df, DeepNN, epochs = 2000)
+
+#train_model(result_df, DeepNN, epochs = 1000)
